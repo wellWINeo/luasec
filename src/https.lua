@@ -70,79 +70,59 @@ local function reg(conn)
    end
 end
 
--- Format the host and port used by an HTTP CONNECT request.
-local function proxy_authority(host, port)
-   host = tostring(host):gsub("^%[(.*)%]$", "%1")
-   if host:find(":", 1, true) then
-      host = "[" .. host .. "]"
-   end
-   return host .. ":" .. tostring(port)
-end
-
--- Send a CONNECT request and consume its complete response header block.
+-- Send CONNECT without consuming bytes that belong to the TLS stream.
 local function connect_proxy(sock, tunnel)
-   local authority = proxy_authority(tunnel.host, tunnel.port)
+   local host = tostring(tunnel.host or ""):gsub("^%[(.*)%]$", "%1")
+   local port = tostring(tunnel.port or "")
+   if host == "" or host:find("[%c%s]") or not port:match("^%d+$") then
+      return nil, "invalid CONNECT authority"
+   end
+   local authority = (host:find(":", 1, true) and ("[" .. host .. "]") or host)
+      .. ":" .. port
    local request = "CONNECT " .. authority .. " HTTP/1.1\r\n"
       .. "Host: " .. authority .. "\r\n"
-   if tunnel.user ~= nil then
-      local credentials = tunnel.user .. ":" .. (tunnel.password or "")
-      local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-      local encoded = credentials:gsub(".", function (character)
-         local byte = string.byte(character)
-         local bits = ""
-         for shift = 7, 0, -1 do
-            bits = bits .. (byte % (2 ^ (shift + 1)) - byte % (2 ^ shift) > 0 and "1" or "0")
-         end
-         return bits
-      end) .. string.rep("0", (6 - (#credentials * 8) % 6) % 6)
-      encoded = encoded:gsub("%d%d%d%d%d%d", function (bits)
-         local value = 0
-         for index = 1, 6 do
-            value = value * 2 + (bits:sub(index, index) == "1" and 1 or 0)
-         end
-         return alphabet:sub(value + 1, value + 1)
-      end)
-      local remainder = #credentials % 3
-      encoded = encoded .. (remainder == 1 and "==" or remainder == 2 and "=" or "")
-      request = request .. "Proxy-Authorization: Basic " .. encoded .. "\r\n"
+   local authorization = tunnel.authorization
+   if authorization then
+      if type(authorization) ~= "string" or authorization:find("[%c]") then
+         return nil, "invalid proxy authorization"
+      end
+   elseif tunnel.user ~= nil then
+      local mime = require("mime")
+      authorization = "Basic " .. mime.b64(tunnel.user .. ":" .. (tunnel.password or ""))
    end
-   request = request .. "\r\n"
-
-   local sent, send_error = sock:send(request)
-   if not sent or send_error then
-      sock:close()
-      return nil, send_error
+   if authorization then
+      request = request .. "Proxy-Authorization: " .. authorization .. "\r\n"
    end
+   local sent, err = sock:send(request .. "\r\n")
+   if not sent then return nil, err end
 
-   local status, receive_error = sock:receive("*l")
-   if not status or receive_error then
-      sock:close()
-      return nil, receive_error
+   -- A byte budget also bounds a single unterminated line. LuaSocket's
+   -- historical receive('*l') API cannot impose this limit.
+   local remaining = 65536
+   local function receiveline()
+      local line = {}
+      while true do
+         if remaining == 0 then return nil, "proxy CONNECT headers too large" end
+         local ch, receive_error = sock:receive(1)
+         if not ch then return nil, receive_error end
+         remaining = remaining - 1
+         if ch == "\n" then return table.concat(line):gsub("\r$", "") end
+         line[#line + 1] = ch
+      end
    end
-   status = status:gsub("\r$", "")
-
+   local status
+   status, err = receiveline()
+   if not status then return nil, err end
+   local code = tonumber(status:match("^HTTP/%d%.%d (%d%d%d)%f[%D]"))
+   if not code or code < 200 or code >= 300 then
+      return nil, "proxy CONNECT failed"
+   end
    while true do
-      local header, header_error = sock:receive("*l")
-      if not header or header_error then
-         sock:close()
-         return nil, header_error
-      end
-      header = header:gsub("\r$", "")
-      if header == "" then
-         break
-      end
+      local line
+      line, err = receiveline()
+      if not line then return nil, err end
+      if line == "" then return true end
    end
-
-   local code = status:match("^HTTP/%d+%.%d+%s+(%d%d%d)")
-   if not code then
-      sock:close()
-      return nil, status
-   end
-   if tonumber(code) < 200 or tonumber(code) >= 300 then
-      sock:close()
-      return nil, "proxy CONNECT failed: " .. status
-   end
-   return true
 end
 
 -- Return a function which performs the SSL/TLS connection.
@@ -158,6 +138,10 @@ local function tcp(params)
    return function ()
       local conn = {}
       conn.sock = try(socket.tcp())
+      function conn:close()
+         return self.sock:close()
+      end
+      local try = socket.newtry(function() conn:close() end)
       local st = getmetatable(conn.sock).__index.settimeout
       function conn:settimeout(...)
          return st(self.sock, _M.TIMEOUT)
@@ -169,7 +153,15 @@ local function tcp(params)
          if tunnel then
             try(connect_proxy(self.sock, tunnel))
          end
-         self.sock = try(ssl.wrap(self.sock, params))
+         -- LuaSocket replaces params.host with the proxy's TCP address.
+         -- TLS identity verification, like SNI, must use the tunnel origin.
+         local tlsparams = params
+         if tunnel then
+            tlsparams = {}
+            for k, v in pairs(params) do tlsparams[k] = v end
+            tlsparams.host = tunnel.host
+         end
+         self.sock = try(ssl.wrap(self.sock, tlsparams))
          self.sock:sni(tunnel and tunnel.host or host)
          self.sock:settimeout(_M.TIMEOUT)
          try(self.sock:dohandshake())
@@ -185,8 +177,8 @@ end
 --------------------------------------------------------------------
 
 -- Make a HTTP request over secure connection.  This function receives
---  the same parameters of LuaSocket's HTTP module (except 'proxy' and
---  'redirect') plus LuaSec parameters.
+--  the same parameters of LuaSocket's HTTP module (except 'redirect')
+--  plus LuaSec parameters. HTTP proxies use CONNECT.
 --
 -- @param url mandatory (string or table)
 -- @param body optional (string)
@@ -200,15 +192,24 @@ local function request(url, body)
   else
     url.url = default_https_port(url.url)
   end
-  if http.PROXY or url.proxy then
-    return nil, "proxy not supported"
-  elseif url.redirect then
+  if url.redirect then
     return nil, "redirect not supported"
   elseif url.create then
     return nil, "create function not permitted"
   end
-  -- New 'create' function to establish a secure connection
-  url.create = tcp(url)
+  if http.PROXY or url.proxy then
+    if url.scheme and url.scheme ~= "https"
+       or require("socket.url").parse(url.url).scheme ~= "https" then
+      return nil, "HTTPS proxy requires an HTTPS URL"
+    end
+    if not http.PROXY_TUNNEL then
+      return nil, "LuaSocket CONNECT support required"
+    end
+    -- Let LuaSocket classify the proxy and build its tunnel descriptor.
+    -- A custom creator would bypass automatic CONNECT classification.
+  else
+    url.create = tcp(url)
+  end
   local res, code, headers, status = http.request(url)
   if res and stringrequest then
     return table.concat(result_table), code, headers, status
@@ -222,5 +223,6 @@ end
 
 _M.request = request
 _M.tcp = tcp
+_M.PROXY_TUNNEL = true
 
 return _M
