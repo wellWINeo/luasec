@@ -49,13 +49,17 @@ end
 package.preload["ltn12"] = function ()
    return { sink = { table = function () return function () end end } }
 end
+local delegated_request
 package.preload["socket.http"] = function ()
-   return {}
+   return { PROXY_TUNNEL = true, request = function (request)
+      delegated_request = request
+      return 1, 302, {}, "302 Found"
+   end }
 end
 package.preload["socket.url"] = function ()
    return {
-      parse = function () return {} end,
-      build = function (value) return value end
+      parse = function (value) return { scheme = value:match("^(https?)://"), original = value } end,
+      build = function (value) return value.original end
    }
 end
 
@@ -67,6 +71,16 @@ package.preload["mime"] = function ()
 end
 
 local https = require("https")
+
+-- Proxied public requests disable LuaSocket's automatic redirect handling.
+do
+   local result, code = https.request({
+      url = "https://origin.example/", proxy = "http://proxy.example:8080"
+   })
+   assert_equal(result, 1, "delegated redirect result")
+   assert_equal(code, 302, "first redirect status")
+   assert_equal(delegated_request.redirect, false, "proxied redirect policy")
+end
 
 local function new_socket(response, send_result, send_error)
    socket_state.events = {}

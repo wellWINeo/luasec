@@ -207,6 +207,7 @@ local function request(url, body)
     end
     -- Let LuaSocket classify the proxy and build its tunnel descriptor.
     -- A custom creator would bypass automatic CONNECT classification.
+    url.redirect = false
   else
     url.create = tcp(url)
   end
